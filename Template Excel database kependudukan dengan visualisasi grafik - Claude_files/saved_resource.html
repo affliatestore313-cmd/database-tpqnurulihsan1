@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="id"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Database Kependudukan</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
+            background: linear-gradient(135deg, #dbeafe 0%, #e0e7ff 100%); 
+            padding: 2rem; 
+            min-height: 100vh;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        
+        .header { 
+            background: white; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
+            padding: 2rem; 
+            margin-bottom: 2rem; 
+        }
+        
+        h1 { font-size: 2rem; color: #1f2937; margin-bottom: 0.5rem; font-weight: 700; }
+        .subtitle { color: #6b7280; margin-bottom: 1rem; }
+        
+        .buttons { display: flex; gap: 0.75rem; margin-top: 1rem; flex-wrap: wrap; }
+        .btn { 
+            padding: 0.75rem 1.5rem; 
+            border: none; 
+            border-radius: 8px; 
+            cursor: pointer; 
+            font-weight: 600; 
+            font-size: 0.875rem;
+            display: inline-flex; 
+            align-items: center; 
+            gap: 0.5rem; 
+            transition: all 0.2s;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.15); }
+        .btn-purple { background: #8b5cf6; color: white; }
+        .btn-purple:hover { background: #7c3aed; }
+        .btn-blue { background: #3b82f6; color: white; }
+        .btn-blue:hover { background: #2563eb; }
+        .btn-green { background: #10b981; color: white; }
+        .btn-green:hover { background: #059669; }
+        
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-top: 1.5rem; }
+        .stat-card { 
+            background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); 
+            border-radius: 8px; 
+            padding: 1.5rem; 
+            color: white; 
+            box-shadow: 0 4px 6px rgba(59, 130, 246, 0.3);
+        }
+        .stat-card:nth-child(2) { background: linear-gradient(135deg, #10b981 0%, #059669 100%); box-shadow: 0 4px 6px rgba(16, 185, 129, 0.3); }
+        .stat-card:nth-child(3) { background: linear-gradient(135deg, #ec4899 0%, #db2777 100%); box-shadow: 0 4px 6px rgba(236, 72, 153, 0.3); }
+        .stat-card:nth-child(4) { background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); box-shadow: 0 4px 6px rgba(139, 92, 246, 0.3); }
+        .stat-label { font-size: 0.875rem; opacity: 0.9; margin-bottom: 0.5rem; }
+        .stat-value { font-size: 2rem; font-weight: bold; }
+        
+        .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
+        .chart-card { 
+            background: white; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
+            padding: 1.5rem; 
+        }
+        .chart-title { font-size: 1.25rem; font-weight: bold; color: #1f2937; margin-bottom: 1rem; }
+        canvas { max-height: 300px; }
+        
+        .table-card { 
+            background: white; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
+            overflow: hidden; 
+        }
+        .table-wrapper { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; min-width: 1200px; }
+        th { 
+            background: linear-gradient(90deg, #2563eb 0%, #4f46e5 100%); 
+            color: white; 
+            padding: 1rem; 
+            text-align: left; 
+            font-weight: 600; 
+            font-size: 0.875rem;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        td { padding: 0.75rem; border-bottom: 1px solid #e5e7eb; font-size: 0.875rem; color: #374151; }
+        tr:hover { background: #f9fafb; }
+        
+        input, select { 
+            width: 100%; 
+            padding: 0.5rem; 
+            border: 1px solid #d1d5db; 
+            border-radius: 4px; 
+            font-size: 0.875rem;
+            transition: all 0.2s;
+        }
+        input:focus, select:focus { 
+            outline: none; 
+            border-color: #3b82f6; 
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+        }
+        
+        .delete-btn { 
+            background: #ef4444; 
+            color: white; 
+            border: none; 
+            padding: 0.5rem 0.75rem; 
+            border-radius: 4px; 
+            cursor: pointer;
+            font-size: 1.2rem;
+            transition: all 0.2s;
+        }
+        .delete-btn:hover { background: #dc2626; transform: scale(1.1); }
+        
+        .hidden { display: none !important; }
+        
+        .info-box {
+            background: #dbeafe;
+            border-left: 4px solid #3b82f6;
+            padding: 1rem;
+            border-radius: 4px;
+            margin-top: 1rem;
+            font-size: 0.875rem;
+            color: #1e40af;
+        }
+
+        @media (max-width: 768px) {
+            body { padding: 1rem; }
+            h1 { font-size: 1.5rem; }
+            .stats { grid-template-columns: repeat(2, 1fr); }
+            .charts { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <div class="container">
+        <div class="header">
+            <h1>📊 Database Kependudukan</h1>
+            <p class="subtitle">Sistem Pencatatan Data Penduduk - Data Tersimpan Otomatis</p>
+            
+            <div class="buttons">
+                <button class="btn btn-purple" onclick="toggleCharts()">
+                    <span id="chartBtnText">📈 Sembunyikan Grafik</span>
+                </button>
+                <button class="btn btn-blue" onclick="addRow()">➕ Tambah Data</button>
+                <button class="btn btn-green" onclick="downloadCSV()">💾 Download CSV</button>
+            </div>
+
+            <div class="info-box">
+                💡 <strong>Info:</strong> Semua data yang Anda input otomatis tersimpan di browser. Data akan tetap ada meskipun Anda menutup halaman ini.
+            </div>
+            
+            <div class="stats" id="stats">
+                <div class="stat-card">
+                    <div class="stat-label">Total Penduduk</div>
+                    <div class="stat-value" id="totalPenduduk">3</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Laki-laki</div>
+                    <div class="stat-value" id="totalLaki">2</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Perempuan</div>
+                    <div class="stat-value" id="totalPerempuan">1</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Dewasa</div>
+                    <div class="stat-value" id="totalDewasa">1</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="charts" id="chartsSection">
+            <div class="chart-card">
+                <h2 class="chart-title">Distribusi Status Penduduk</h2>
+                <div style="text-align: center; margin-bottom: 10px;">
+                    <strong style="color: #3b82f6; font-size: 1.1rem;">Total: <span id="totalStatus">3</span> orang</strong>
+                </div>
+                <canvas id="statusChart" width="777" height="450" style="display: block; box-sizing: border-box; height: 300px; width: 518px;"></canvas>
+            </div>
+            <div class="chart-card">
+                <h2 class="chart-title">Distribusi Jenis Kelamin</h2>
+                <div style="text-align: center; margin-bottom: 10px;">
+                    <strong style="color: #3b82f6; font-size: 1.1rem;">Total: <span id="totalGender">3</span> orang</strong>
+                </div>
+                <canvas id="genderChart" width="777" height="450" style="display: block; box-sizing: border-box; height: 300px; width: 518px;"></canvas>
+            </div>
+        </div>
+
+        <div class="table-card">
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th style="width: 50px;">No</th>
+                            <th style="width: 150px;">NIK</th>
+                            <th style="width: 180px;">Nama</th>
+                            <th style="width: 120px;">Tempat Lahir</th>
+                            <th style="width: 140px;">Tanggal Lahir</th>
+                            <th style="width: 130px;">Jenis Kelamin</th>
+                            <th style="width: 130px;">Status</th>
+                            <th style="width: 200px;">Alamat</th>
+                            <th style="width: 100px;">Agama</th>
+                            <th style="width: 150px;">Pekerjaan</th>
+                            <th style="width: 80px;">Aksi</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tableBody">
+                <tr>
+                    <td>1</td>
+                    <td><input type="text" value="3515012345670001" onchange="updateCell(1, &#39;nik&#39;, this.value)" placeholder="NIK"></td>
+                    <td><input type="text" value="Ahmad Rizki" onchange="updateCell(1, &#39;nama&#39;, this.value)" placeholder="Nama"></td>
+                    <td><input type="text" value="Sidoarjo" onchange="updateCell(1, &#39;tempatLahir&#39;, this.value)" placeholder="Tempat Lahir"></td>
+                    <td><input type="date" value="1990-05-15" onchange="updateCell(1, &#39;tanggalLahir&#39;, this.value)"></td>
+                    <td>
+                        <select onchange="updateCell(1, &#39;jenisKelamin&#39;, this.value)">
+                            <option selected="">Laki-laki</option>
+                            <option>Perempuan</option>
+                        </select>
+                    </td>
+                    <td>
+                        <select onchange="updateCell(1, &#39;status&#39;, this.value)">
+                            <option>Caberawit</option>
+                            <option>Pra Remaja</option>
+                            <option>Remaja</option>
+                            <option>Pra-Nikah</option>
+                            <option selected="">Dewasa</option>
+                        </select>
+                    </td>
+                    <td><input type="text" value="Jl. Raya Sidoarjo No. 123" onchange="updateCell(1, &#39;alamat&#39;, this.value)" placeholder="Alamat"></td>
+                    <td><input type="text" value="Islam" onchange="updateCell(1, &#39;agama&#39;, this.value)" placeholder="Agama"></td>
+                    <td><input type="text" value="Wiraswasta" onchange="updateCell(1, &#39;pekerjaan&#39;, this.value)" placeholder="Pekerjaan"></td>
+                    <td><button class="delete-btn" onclick="deleteRow(1)" title="Hapus data">🗑️</button></td>
+                </tr>
+            
+                <tr>
+                    <td>2</td>
+                    <td><input type="text" value="3515012345670002" onchange="updateCell(2, &#39;nik&#39;, this.value)" placeholder="NIK"></td>
+                    <td><input type="text" value="Siti Nurhaliza" onchange="updateCell(2, &#39;nama&#39;, this.value)" placeholder="Nama"></td>
+                    <td><input type="text" value="Surabaya" onchange="updateCell(2, &#39;tempatLahir&#39;, this.value)" placeholder="Tempat Lahir"></td>
+                    <td><input type="date" value="1995-08-20" onchange="updateCell(2, &#39;tanggalLahir&#39;, this.value)"></td>
+                    <td>
+                        <select onchange="updateCell(2, &#39;jenisKelamin&#39;, this.value)">
+                            <option>Laki-laki</option>
+                            <option selected="">Perempuan</option>
+                        </select>
+                    </td>
+                    <td>
+                        <select onchange="updateCell(2, &#39;status&#39;, this.value)">
+                            <option>Caberawit</option>
+                            <option>Pra Remaja</option>
+                            <option>Remaja</option>
+                            <option selected="">Pra-Nikah</option>
+                            <option>Dewasa</option>
+                        </select>
+                    </td>
+                    <td><input type="text" value="Jl. Mawar No. 45" onchange="updateCell(2, &#39;alamat&#39;, this.value)" placeholder="Alamat"></td>
+                    <td><input type="text" value="Islam" onchange="updateCell(2, &#39;agama&#39;, this.value)" placeholder="Agama"></td>
+                    <td><input type="text" value="Pegawai Swasta" onchange="updateCell(2, &#39;pekerjaan&#39;, this.value)" placeholder="Pekerjaan"></td>
+                    <td><button class="delete-btn" onclick="deleteRow(2)" title="Hapus data">🗑️</button></td>
+                </tr>
+            
+                <tr>
+                    <td>3</td>
+                    <td><input type="text" value="3515012345670003" onchange="updateCell(3, &#39;nik&#39;, this.value)" placeholder="NIK"></td>
+                    <td><input type="text" value="Budi Santoso" onchange="updateCell(3, &#39;nama&#39;, this.value)" placeholder="Nama"></td>
+                    <td><input type="text" value="Sidoarjo" onchange="updateCell(3, &#39;tempatLahir&#39;, this.value)" placeholder="Tempat Lahir"></td>
+                    <td><input type="date" value="2010-03-10" onchange="updateCell(3, &#39;tanggalLahir&#39;, this.value)"></td>
+                    <td>
+                        <select onchange="updateCell(3, &#39;jenisKelamin&#39;, this.value)">
+                            <option selected="">Laki-laki</option>
+                            <option>Perempuan</option>
+                        </select>
+                    </td>
+                    <td>
+                        <select onchange="updateCell(3, &#39;status&#39;, this.value)">
+                            <option>Caberawit</option>
+                            <option selected="">Pra Remaja</option>
+                            <option>Remaja</option>
+                            <option>Pra-Nikah</option>
+                            <option>Dewasa</option>
+                        </select>
+                    </td>
+                    <td><input type="text" value="Jl. Melati No. 78" onchange="updateCell(3, &#39;alamat&#39;, this.value)" placeholder="Alamat"></td>
+                    <td><input type="text" value="Islam" onchange="updateCell(3, &#39;agama&#39;, this.value)" placeholder="Agama"></td>
+                    <td><input type="text" value="Pelajar" onchange="updateCell(3, &#39;pekerjaan&#39;, this.value)" placeholder="Pekerjaan"></td>
+                    <td><button class="delete-btn" onclick="deleteRow(3)" title="Hapus data">🗑️</button></td>
+                </tr>
+            </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Data awal
+        let data = [
+            {
+                id: 1,
+                nik: '3515012345670001',
+                nama: 'Ahmad Rizki',
+                tempatLahir: 'Sidoarjo',
+                tanggalLahir: '1990-05-15',
+                jenisKelamin: 'Laki-laki',
+                status: 'Dewasa',
+                alamat: 'Jl. Raya Sidoarjo No. 123',
+                agama: 'Islam',
+                pekerjaan: 'Wiraswasta'
+            },
+            {
+                id: 2,
+                nik: '3515012345670002',
+                nama: 'Siti Nurhaliza',
+                tempatLahir: 'Surabaya',
+                tanggalLahir: '1995-08-20',
+                jenisKelamin: 'Perempuan',
+                status: 'Pra-Nikah',
+                alamat: 'Jl. Mawar No. 45',
+                agama: 'Islam',
+                pekerjaan: 'Pegawai Swasta'
+            },
+            {
+                id: 3,
+                nik: '3515012345670003',
+                nama: 'Budi Santoso',
+                tempatLahir: 'Sidoarjo',
+                tanggalLahir: '2010-03-10',
+                jenisKelamin: 'Laki-laki',
+                status: 'Pra Remaja',
+                alamat: 'Jl. Melati No. 78',
+                agama: 'Islam',
+                pekerjaan: 'Pelajar'
+            }
+        ];
+
+        let statusChart, genderChart;
+        let showCharts = true;
+
+        // Simpan data ke localStorage
+        function saveData() {
+            localStorage.setItem('kependudukanData', JSON.stringify(data));
+            updateStats();
+            updateCharts();
+        }
+
+        // Load data dari localStorage
+        function loadData() {
+            const saved = localStorage.getItem('kependudukanData');
+            if (saved) {
+                data = JSON.parse(saved);
+            }
+            renderTable();
+            updateStats();
+            initCharts();
+        }
+
+        // Render tabel
+        function renderTable() {
+            const tbody = document.getElementById('tableBody');
+            tbody.innerHTML = data.map((row, index) => `
+                <tr>
+                    <td>${index + 1}</td>
+                    <td><input type="text" value="${row.nik}" onchange="updateCell(${row.id}, 'nik', this.value)" placeholder="NIK"></td>
+                    <td><input type="text" value="${row.nama}" onchange="updateCell(${row.id}, 'nama', this.value)" placeholder="Nama"></td>
+                    <td><input type="text" value="${row.tempatLahir}" onchange="updateCell(${row.id}, 'tempatLahir', this.value)" placeholder="Tempat Lahir"></td>
+                    <td><input type="date" value="${row.tanggalLahir}" onchange="updateCell(${row.id}, 'tanggalLahir', this.value)"></td>
+                    <td>
+                        <select onchange="updateCell(${row.id}, 'jenisKelamin', this.value)">
+                            <option ${row.jenisKelamin === 'Laki-laki' ? 'selected' : ''}>Laki-laki</option>
+                            <option ${row.jenisKelamin === 'Perempuan' ? 'selected' : ''}>Perempuan</option>
+                        </select>
+                    </td>
+                    <td>
+                        <select onchange="updateCell(${row.id}, 'status', this.value)">
+                            <option ${row.status === 'Caberawit' ? 'selected' : ''}>Caberawit</option>
+                            <option ${row.status === 'Pra Remaja' ? 'selected' : ''}>Pra Remaja</option>
+                            <option ${row.status === 'Remaja' ? 'selected' : ''}>Remaja</option>
+                            <option ${row.status === 'Pra-Nikah' ? 'selected' : ''}>Pra-Nikah</option>
+                            <option ${row.status === 'Dewasa' ? 'selected' : ''}>Dewasa</option>
+                        </select>
+                    </td>
+                    <td><input type="text" value="${row.alamat}" onchange="updateCell(${row.id}, 'alamat', this.value)" placeholder="Alamat"></td>
+                    <td><input type="text" value="${row.agama}" onchange="updateCell(${row.id}, 'agama', this.value)" placeholder="Agama"></td>
+                    <td><input type="text" value="${row.pekerjaan}" onchange="updateCell(${row.id}, 'pekerjaan', this.value)" placeholder="Pekerjaan"></td>
+                    <td><button class="delete-btn" onclick="deleteRow(${row.id})" title="Hapus data">🗑️</button></td>
+                </tr>
+            `).join('');
+        }
+
+        // Update cell
+        function updateCell(id, field, value) {
+            const row = data.find(r => r.id === id);
+            if (row) {
+                row[field] = value;
+                saveData();
+            }
+        }
+
+        // Tambah baris baru
+        function addRow() {
+            const newId = data.length > 0 ? Math.max(...data.map(d => d.id)) + 1 : 1;
+            data.push({
+                id: newId,
+                nik: '',
+                nama: '',
+                tempatLahir: '',
+                tanggalLahir: '',
+                jenisKelamin: 'Laki-laki',
+                status: 'Dewasa',
+                alamat: '',
+                agama: '',
+                pekerjaan: ''
+            });
+            renderTable();
+            saveData();
+        }
+
+        // Hapus baris
+        function deleteRow(id) {
+            if (confirm('Yakin ingin menghapus data ini?')) {
+                data = data.filter(r => r.id !== id);
+                renderTable();
+                saveData();
+            }
+        }
+
+        // Update statistik
+        function updateStats() {
+            document.getElementById('totalPenduduk').textContent = data.length;
+            document.getElementById('totalLaki').textContent = data.filter(d => d.jenisKelamin === 'Laki-laki').length;
+            document.getElementById('totalPerempuan').textContent = data.filter(d => d.jenisKelamin === 'Perempuan').length;
+            document.getElementById('totalDewasa').textContent = data.filter(d => d.status === 'Dewasa').length;
+        }
+
+        // Inisialisasi chart
+        function initCharts() {
+            const statusCtx = document.getElementById('statusChart').getContext('2d');
+            const genderCtx = document.getElementById('genderChart').getContext('2d');
+
+            statusChart = new Chart(statusCtx, {
+                type: 'pie',
+                data: { 
+                    labels: [], 
+                    datasets: [{ 
+                        data: [], 
+                        backgroundColor: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'],
+                        borderWidth: 2,
+                        borderColor: '#fff'
+                    }] 
+                },
+                options: { 
+                    responsive: true, 
+                    maintainAspectRatio: true, 
+                    plugins: { 
+                        legend: { position: 'bottom', labels: { padding: 15, font: { size: 12 } } },
+                        tooltip: { 
+                            callbacks: {
+                                label: function(context) {
+                                    const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                                    const value = context.parsed;
+                                    const percentage = ((value / total) * 100).toFixed(1);
+                                    return context.label + ': ' + value + ' orang (' + percentage + '%)';
+                                }
+                            }
+                        },
+                        datalabels: {
+                            display: true,
+                            color: '#fff',
+                            font: { weight: 'bold', size: 14 },
+                            formatter: function(value, context) {
+                                const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                                const percentage = ((value / total) * 100).toFixed(1);
+                                return value > 0 ? percentage + '%' : '';
+                            }
+                        }
+                    } 
+                }
+            });
+
+            genderChart = new Chart(genderCtx, {
+                type: 'pie',
+                data: { 
+                    labels: [], 
+                    datasets: [{ 
+                        data: [], 
+                        backgroundColor: ['#10b981', '#ec4899'],
+                        borderWidth: 2,
+                        borderColor: '#fff'
+                    }] 
+                },
+                options: { 
+                    responsive: true, 
+                    maintainAspectRatio: true, 
+                    plugins: { 
+                        legend: { position: 'bottom', labels: { padding: 15, font: { size: 12 } } },
+                        tooltip: { 
+                            callbacks: {
+                                label: function(context) {
+                                    const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                                    const value = context.parsed;
+                                    const percentage = ((value / total) * 100).toFixed(1);
+                                    return context.label + ': ' + value + ' orang (' + percentage + '%)';
+                                }
+                            }
+                        },
+                        datalabels: {
+                            display: true,
+                            color: '#fff',
+                            font: { weight: 'bold', size: 14 },
+                            formatter: function(value, context) {
+                                const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                                const percentage = ((value / total) * 100).toFixed(1);
+                                return value > 0 ? percentage + '%' : '';
+                            }
+                        }
+                    } 
+                }
+            });
+
+            updateCharts();
+        }
+
+        // Update chart
+        function updateCharts() {
+            const statusData = ['Caberawit', 'Pra Remaja', 'Remaja', 'Pra-Nikah', 'Dewasa'].map(status => ({
+                name: status,
+                value: data.filter(d => d.status === status).length
+            }));
+
+            const genderData = [
+                { name: 'Laki-laki', value: data.filter(d => d.jenisKelamin === 'Laki-laki').length },
+                { name: 'Perempuan', value: data.filter(d => d.jenisKelamin === 'Perempuan').length }
+            ];
+
+            // Update total di atas grafik
+            const totalStatus = statusData.reduce((sum, item) => sum + item.value, 0);
+            const totalGender = genderData.reduce((sum, item) => sum + item.value, 0);
+            document.getElementById('totalStatus').textContent = totalStatus;
+            document.getElementById('totalGender').textContent = totalGender;
+
+            statusChart.data.labels = statusData.map(d => d.name);
+            statusChart.data.datasets[0].data = statusData.map(d => d.value);
+            statusChart.update();
+
+            genderChart.data.labels = genderData.map(d => d.name);
+            genderChart.data.datasets[0].data = genderData.map(d => d.value);
+            genderChart.update();
+        }
+
+        // Toggle grafik
+        function toggleCharts() {
+            showCharts = !showCharts;
+            document.getElementById('chartsSection').classList.toggle('hidden');
+            document.getElementById('chartBtnText').textContent = showCharts ? '📈 Sembunyikan Grafik' : '📈 Tampilkan Grafik';
+        }
+
+        // Download CSV
+        function downloadCSV() {
+            const headers = ['NIK', 'Nama', 'Tempat Lahir', 'Tanggal Lahir', 'Jenis Kelamin', 'Status', 'Alamat', 'Agama', 'Pekerjaan'];
+            const csvContent = [
+                headers.join(','),
+                ...data.map(row => [
+                    '"' + row.nik + '"',
+                    '"' + row.nama + '"',
+                    '"' + row.tempatLahir + '"',
+                    '"' + row.tanggalLahir + '"',
+                    '"' + row.jenisKelamin + '"',
+                    '"' + row.status + '"',
+                    '"' + row.alamat + '"',
+                    '"' + row.agama + '"',
+                    '"' + row.pekerjaan + '"'
+                ].join(','))
+            ].join('\n');
+
+            const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'database_kependudukan_' + new Date().toISOString().split('T')[0] + '.csv';
+            link.click();
+            URL.revokeObjectURL(url);
+            alert('✅ File CSV berhasil didownload!');
+        }
+
+        // Load saat halaman dimuat
+        window.onload = loadData;
+    </script>
+
+</body></html>
